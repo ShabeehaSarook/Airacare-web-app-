@@ -132,6 +132,11 @@ def evaluate_risk(
             level = max_level(level, MEDIUM_RISK)
             score = max(score, 55)
 
+    if zone == PATH_IN and distance_m <= cfg["high_distance_m"] and vehicle_speed_kmh >= cfg["significant_vehicle_speed_kmh"]:
+        level = HIGH_RISK
+        score = max(score, 75)
+        reasons.append("close object in path while vehicle is moving")
+
     if zone == PATH_NEAR and movement_state == "CLOSING" and distance_m <= cfg["high_distance_m"]:
         level = max_level(level, MEDIUM_RISK)
         score = max(score, 50)
@@ -195,3 +200,4 @@ class RiskSmoother:
             self.last_seen.pop(track_id, None)
             self.history.pop(track_id, None)
             self.current.pop(track_id, None)
+

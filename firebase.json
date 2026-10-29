@@ -1,9 +1,9 @@
 {
   "firestore": {
-    "rules": "firestore.rules"
+    "rules": "database/firestore.rules"
   },
   "hosting": {
-    "public": "web_client",
+    "public": "frontend",
     "ignore": [
       "firebase.json",
       "**/.*",

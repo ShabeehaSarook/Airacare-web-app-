@@ -2,9 +2,14 @@ venv/
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
+.firebase/
+tmp_*_payload*.json
 .DS_Store
-results/*
-!results/.gitkeep
+results/
+runs/
+test_data/generated/
 models/*.pt
 !models/airacare_animal_detector_best.pt
 !models/.gitkeep

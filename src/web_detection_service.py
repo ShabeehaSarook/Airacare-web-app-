@@ -100,7 +100,7 @@ class _TrackMemory:
 
 
 class WebDetectionService:
-    """Stateful detector used by the FastAPI backend."""
+    """Stateful detector used by the Flask backend."""
 
     def __init__(self, config: WebDetectionConfig | None = None) -> None:
         self.config = config or WebDetectionConfig()

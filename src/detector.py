@@ -17,9 +17,11 @@ from urllib.request import Request, urlopen
 import cv2
 from ultralytics import YOLO
 
-from src.config import KNOWN_OBJECT_HEIGHTS_METERS, TARGET_CLASSES, TARGET_CLASS_SET, WARNING_CONFIG
+from src.config import ANIMAL_CLASS_SET, KNOWN_OBJECT_HEIGHTS_METERS, TARGET_CLASSES, TARGET_CLASS_SET, WARNING_CONFIG
 from src.distance import (
     DEFAULT_CALIBRATION_PATH,
+    PHONE_CALIBRATION_PATH,
+    WEBCAM_CALIBRATION_PATH,
     DistanceHistory,
     estimate_distance,
     focal_length_for_runtime_resolution,
@@ -52,12 +54,16 @@ CAMERA_INDEX = 0
 CAMERA_SOURCE = os.getenv("AIRACARE_CAMERA_SOURCE", str(CAMERA_INDEX))
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
+CAMERA_FPS = 30
 INFERENCE_IMAGE_SIZE = 640
 DEFAULT_TRACKER = "bytetrack.yaml"
 DISTANCE_ENABLED_DEFAULT = True
 FIRST_FRAME_TIMEOUT_SECONDS = 10.0
 NETWORK_CAMERA_CHECK_TIMEOUT_SECONDS = 3.0
 STALE_FRAME_WARNING_SECONDS = 3.0
+NETWORK_RECONNECT_AFTER_FAILURES = 30
+WEBCAM_WARMUP_FRAMES = 25
+MIN_USABLE_FRAME_BRIGHTNESS = 3.0
 CONSOLE_LOG_INTERVAL_SECONDS = 2.0
 LIVE_CAPTURE_DIR = PROJECT_ROOT / "results" / "phase15_sensor_captures"
 
@@ -74,12 +80,45 @@ RISK_COLORS = {
 }
 
 
+
+def webcam_backend_candidates() -> list[tuple[str, int | None]]:
+    """Return webcam backends in a practical Windows-first fallback order."""
+    if os.name == "nt":
+        return [
+            ("DSHOW", cv2.CAP_DSHOW),
+            ("MSMF", cv2.CAP_MSMF),
+            ("DEFAULT", None),
+        ]
+    return [("DEFAULT", None)]
+
+
+def frame_mean_brightness(frame: Any) -> float:
+    """Measure frame brightness cheaply for webcam startup validation."""
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return 0.0
+    grayscale = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(grayscale.mean())
+
+
+def resize_frame_to_max_width(frame: Any, max_width: int) -> Any:
+    """Downscale large camera frames for faster CPU inference/display."""
+    if max_width is None or max_width <= 0 or frame is None or getattr(frame, "size", 0) == 0:
+        return frame
+    height, width = frame.shape[:2]
+    if width <= max_width:
+        return frame
+    scale = max_width / float(width)
+    new_size = (int(round(width * scale)), int(round(height * scale)))
+    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+
+
 class LatestFrameCapture:
     """Read frames in the background and retain only the newest frame."""
 
-    def __init__(self, source: str | int, is_network_source: bool) -> None:
+    def __init__(self, source: str | int, is_network_source: bool, debug_camera: bool = False) -> None:
         self.source = source
         self.is_network_source = is_network_source
+        self.debug_camera = debug_camera
         self.capture: cv2.VideoCapture | None = None
         self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
@@ -88,19 +127,90 @@ class LatestFrameCapture:
         self.latest_frame_id = 0
         self.last_frame_time = 0.0
         self.last_error: str | None = None
+        self.backend_name = "network" if is_network_source else "unknown"
 
     def open(self) -> bool:
         if self.is_network_source:
             os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "fflags;nobuffer|flags;low_delay|max_delay;0")
+            self.capture = cv2.VideoCapture(self.source)
+            self.backend_name = "network"
+            if not self.capture.isOpened():
+                return False
+            self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return True
 
-        self.capture = cv2.VideoCapture(self.source)
-        if not self.capture.isOpened():
+        return self._open_webcam_with_fallbacks()
+
+    def _open_webcam_with_fallbacks(self) -> bool:
+        for backend_name, backend in webcam_backend_candidates():
+            print(f"Trying webcam backend: {backend_name}")
+            capture = cv2.VideoCapture(self.source, backend) if backend is not None else cv2.VideoCapture(self.source)
+            if not capture.isOpened():
+                if self.debug_camera:
+                    print(f"Camera backend {backend_name}: could not open source {self.source}")
+                capture.release()
+                continue
+
+            self.capture = capture
+            self.backend_name = backend_name
+            self._configure_webcam_capture()
+            if self._warm_up_webcam():
+                return True
+
+            print(f"Camera backend {backend_name}: frames were not usable; trying next backend.")
+            self.capture.release()
+            self.capture = None
+
+        self.last_error = "Camera opened but frames are unusably dark, or no backend could read valid frames."
+        return False
+
+    def _configure_webcam_capture(self) -> None:
+        if self.capture is None:
+            return
+        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        self.capture.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+
+    def _warm_up_webcam(self) -> bool:
+        if self.capture is None:
+            return False
+        valid_frames = 0
+        last_frame = None
+        last_brightness = 0.0
+        for _ in range(WEBCAM_WARMUP_FRAMES):
+            ok, frame = self.capture.read()
+            if not ok or frame is None or frame.size == 0:
+                time.sleep(0.02)
+                continue
+            valid_frames += 1
+            last_frame = frame
+            last_brightness = frame_mean_brightness(frame)
+            time.sleep(0.01)
+
+        width = int(self.capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if self.debug_camera:
+            print(
+                f"Camera backend {self.backend_name}: valid_frames={valid_frames} "
+                f"resolution={width}x{height} mean_brightness={last_brightness:.1f}"
+            )
+
+        if last_frame is None:
+            self.last_error = "Camera opened but no valid frames were read during warm-up."
+            return False
+        if last_brightness < MIN_USABLE_FRAME_BRIGHTNESS:
+            self.last_error = (
+                "Camera opened but frames are unusably dark. Check privacy shutter, camera permissions, "
+                "exposure, or another application using the camera."
+            )
             return False
 
-        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if not self.is_network_source:
-            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        with self.lock:
+            self.latest_frame = last_frame
+            self.latest_frame_id += 1
+            self.last_frame_time = time.perf_counter()
+            self.last_error = None
         return True
 
     def start(self) -> None:
@@ -109,18 +219,34 @@ class LatestFrameCapture:
         self.thread.start()
 
     def _reader_loop(self) -> None:
+        consecutive_failures = 0
         while self.running and self.capture is not None:
             ok, frame = self.capture.read()
             if not ok or frame is None:
+                consecutive_failures += 1
                 self.last_error = "Could not read frame from camera source."
-                time.sleep(0.01)
+                if self.is_network_source and consecutive_failures >= NETWORK_RECONNECT_AFTER_FAILURES:
+                    self._reconnect_network_source()
+                    consecutive_failures = 0
+                time.sleep(0.03)
                 continue
 
+            consecutive_failures = 0
             with self.lock:
                 self.latest_frame = frame
                 self.latest_frame_id += 1
                 self.last_frame_time = time.perf_counter()
                 self.last_error = None
+
+    def _reconnect_network_source(self) -> None:
+        if self.capture is not None:
+            self.capture.release()
+        self.capture = cv2.VideoCapture(self.source)
+        if self.capture.isOpened():
+            self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.last_error = None
+        else:
+            self.last_error = "Network camera reconnect attempt failed."
 
     def wait_for_frame(self, timeout_seconds: float) -> bool:
         deadline = time.perf_counter() + timeout_seconds
@@ -147,7 +273,6 @@ class LatestFrameCapture:
         if self.capture is not None:
             self.capture.release()
             self.capture = None
-
 
 def normalize_model_names(names: Any) -> dict[int, str]:
     if isinstance(names, dict):
@@ -177,6 +302,26 @@ def resolve_device(requested_device: str = "auto") -> str:
     return "cpu"
 
 
+
+def select_calibration_path(camera_source: str | int, requested_path: str | Path) -> Path:
+    """Choose a camera-specific calibration profile when the default path is requested."""
+    explicit_path = Path(requested_path)
+    if explicit_path != DEFAULT_CALIBRATION_PATH:
+        return explicit_path
+    if isinstance(camera_source, str) and camera_source.lower().startswith(("http://", "https://", "rtsp://")):
+        if PHONE_CALIBRATION_PATH.exists():
+            return PHONE_CALIBRATION_PATH
+    elif WEBCAM_CALIBRATION_PATH.exists():
+        return WEBCAM_CALIBRATION_PATH
+    return explicit_path
+
+
+def safe_destroy_windows() -> None:
+    """Close OpenCV windows without masking the real detector result."""
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error as error:
+        print(f"OpenCV window cleanup warning: {error}")
 def sanitize_camera_source(source: str | int) -> str | int:
     if isinstance(source, int):
         return source
@@ -187,7 +332,7 @@ def sanitize_camera_source(source: str | int) -> str | int:
         source_text,
     )
     if markdown_match:
-        return markdown_match.group("url")
+        raise ValueError("Camera source must be a plain URL, not a Markdown link. Use http://PHONE_IP:8080/video")
 
     if source_text.isdigit():
         return int(source_text)
@@ -299,7 +444,15 @@ def print_pretrained_target_support(model: Any) -> None:
     print()
 
 
-def load_detection_model() -> tuple[Any | None, bool, Path | None]:
+def load_detection_model(model_mode: str = "auto") -> tuple[Any | None, bool, Path | None]:
+    mode = model_mode.lower().strip()
+    if mode not in {"auto", "custom", "pretrained"}:
+        print(f"Error: Unsupported model mode: {model_mode}")
+        return None, False, None
+
+    if mode == "pretrained":
+        return load_pretrained_demo_model()
+
     if CUSTOM_MODEL_PATH.exists():
         try:
             model = YOLO(str(CUSTOM_MODEL_PATH))
@@ -312,9 +465,19 @@ def load_detection_model() -> tuple[Any | None, bool, Path | None]:
             return None, False, CUSTOM_MODEL_PATH
         return model, False, CUSTOM_MODEL_PATH
 
+    if mode == "custom":
+        print(f"Error: Custom Airacare model not found: {CUSTOM_MODEL_PATH}")
+        return None, False, CUSTOM_MODEL_PATH
+
     print(f"Warning: Custom model not found: {CUSTOM_MODEL_PATH}")
     print(f"Using pretrained demo model instead: {PRETRAINED_FALLBACK_MODEL_PATH}")
     print("Airacare-only deer/goat detection requires the trained 7-class model.")
+    return load_pretrained_demo_model()
+
+
+
+def load_pretrained_demo_model() -> tuple[Any | None, bool, Path | None]:
+    print(f"Using pretrained demo model: {PRETRAINED_FALLBACK_MODEL_PATH}")
     if not PRETRAINED_FALLBACK_MODEL_PATH.exists():
         print(f"Error: Pretrained fallback model not found: {PRETRAINED_FALLBACK_MODEL_PATH}")
         return None, True, PRETRAINED_FALLBACK_MODEL_PATH
@@ -330,6 +493,14 @@ def load_detection_model() -> tuple[Any | None, bool, Path | None]:
     return model, True, PRETRAINED_FALLBACK_MODEL_PATH
 
 
+def is_normal_airacare_display_class(class_name: str) -> bool:
+    """Return True for all configured Airacare classes shown in normal mode."""
+    return class_name in TARGET_CLASS_SET
+
+
+def is_risk_relevant_class(class_name: str) -> bool:
+    """Animals and pedestrians can participate in road-risk analysis."""
+    return class_name in TARGET_CLASS_SET
 def draw_text_with_background(frame, text: str, position: tuple[int, int], color=TEXT_COLOR) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.58
@@ -515,7 +686,9 @@ def run_detection(
     iou_threshold: float = IOU_THRESHOLD,
     no_detection: bool = False,
     requested_device: str = "auto",
+    model_mode: str = "auto",
     debug_detections: bool = False,
+    show_non_animal_detections: bool = False,
     tracking_enabled: bool = True,
     tracker_config: str = DEFAULT_TRACKER,
     distance_enabled: bool = DISTANCE_ENABLED_DEFAULT,
@@ -539,8 +712,13 @@ def run_detection(
     thermal_source: str | None = None,
     sensor_calibration_path: str | Path = DEFAULT_SENSOR_CALIBRATION_PATH,
     debug_sensors: bool = False,
+    debug_camera: bool = False,
 ) -> int:
-    selected_camera_source = sanitize_camera_source(camera_source if camera_source is not None else CAMERA_SOURCE)
+    try:
+        selected_camera_source = sanitize_camera_source(camera_source if camera_source is not None else CAMERA_SOURCE)
+    except ValueError as error:
+        print(f"Error: {error}")
+        return 1
     selected_camera_source = normalize_network_camera_url(selected_camera_source)
     is_network_source = is_network_camera_source(selected_camera_source)
     source_name = source_label(is_network_source)
@@ -552,7 +730,9 @@ def run_detection(
     print("Phase 15: Optional Sensor Integration + Sensor Fusion")
     print(f"Camera source: {source_name}")
     print(f"Camera source value: {selected_camera_source}")
-    print(f"Model: {CUSTOM_MODEL_PATH if CUSTOM_MODEL_PATH.exists() else PRETRAINED_FALLBACK_MODEL_PATH}")
+    selected_model_path_for_log = PRETRAINED_FALLBACK_MODEL_PATH if model_mode == "pretrained" else (CUSTOM_MODEL_PATH if CUSTOM_MODEL_PATH.exists() else PRETRAINED_FALLBACK_MODEL_PATH)
+    print(f"Model mode: {model_mode}")
+    print(f"Model: {selected_model_path_for_log}")
     print(f"Device: {device.upper() if device != '0' else 'CUDA'}")
     print(f"Inference size: {inference_image_size}")
     print(f"Confidence threshold: {confidence_threshold:.2f}")
@@ -566,10 +746,13 @@ def run_detection(
     print("Distance, closing speed, and TTC are estimates based on monocular camera calibration.")
     print("Phase 14 improves RGB frame visibility when possible, but does not create thermal/night-vision capability.")
     print(f"Distance requested: {distance_enabled}")
+    calibration_path = select_calibration_path(selected_camera_source, calibration_path)
     print(f"Calibration file: {calibration_path}")
     print(f"Closing threshold: {CLOSING_THRESHOLD_MPS:.2f} m/s")
     print(f"Relative motion history: {RELATIVE_HISTORY_LIMIT} samples")
     print(f"Debug detections: {debug_detections}")
+    print(f"Debug camera: {debug_camera}")
+    print(f"Show non-animal detections: {show_non_animal_detections}")
     print(f"Debug distance: {debug_distance}")
     print(f"Debug motion: {debug_motion}")
     print(f"Debug risk: {debug_risk}")
@@ -594,7 +777,7 @@ def run_detection(
     using_pretrained_fallback = False
     if not no_detection:
         print("Loading YOLO model...")
-        model, using_pretrained_fallback, loaded_model_path = load_detection_model()
+        model, using_pretrained_fallback, loaded_model_path = load_detection_model(model_mode)
         if model is None:
             return 1
         print(f"YOLO model loaded successfully: {loaded_model_path}")
@@ -629,7 +812,7 @@ def run_detection(
         visibility_config = load_visibility_config("__missing_visibility_config__.json")
 
     print("Connecting to phone camera..." if is_network_source else "Opening webcam...")
-    capture = LatestFrameCapture(selected_camera_source, is_network_source)
+    capture = LatestFrameCapture(selected_camera_source, is_network_source, debug_camera=debug_camera)
     track_history = TrackHistory(movement_threshold_pixels=MOVEMENT_THRESHOLD_PIXELS)
     distance_history = DistanceHistory()
     motion_analyzer = RelativeMotionAnalyzer()
@@ -650,6 +833,8 @@ def run_detection(
     try:
         if not capture.open():
             print(f"Error: Could not open camera source: {selected_camera_source}")
+            if capture.last_error:
+                print(capture.last_error)
             print_connection_help(is_network_source)
             return 1
 
@@ -750,6 +935,9 @@ def run_detection(
 
                 if debug_detections:
                     print("Detected:")
+                    print(f"Raw YOLO boxes above threshold: {len(boxes)}")
+                    if not boxes:
+                        print("- none from YOLO; improve lighting/framing or lower --confidence")
 
                 used_sensor_keys: set[str | int] = set()
                 for index, detected_box in enumerate(boxes, start=1):
@@ -757,11 +945,21 @@ def run_detection(
                     class_id = int(detected_box.cls[0])
                     class_name = model_names.get(class_id, f"class_{class_id}").lower()
                     coordinates = tuple(float(value) for value in detected_box.xyxy[0].tolist())
+                    if debug_detections:
+                        rounded_raw_box = tuple(round(value, 1) for value in coordinates)
+                        print(f"- raw {class_name} confidence={confidence:.2f} box={rounded_raw_box}")
 
                     if class_name not in TARGET_CLASS_SET:
+                        if debug_detections:
+                            print("  skipped: not an Airacare target class")
                         continue
                     if using_pretrained_fallback and class_name in {"deer", "goat"}:
+                        if debug_detections:
+                            print("  skipped: pretrained model does not support reliable deer/goat")
                         continue
+                    is_airacare_animal = class_name in ANIMAL_CLASS_SET
+                    is_person = class_name == "person"
+                    is_risk_relevant = is_risk_relevant_class(class_name)
 
                     x1, y1, x2, y2 = coordinates
                     center = ((x1 + x2) / 2, (y1 + y2) / 2)
@@ -773,7 +971,7 @@ def run_detection(
                     bbox_height = max(0.0, y2 - y1)
                     raw_distance = (
                         estimate_distance(class_name, bbox_height, runtime_focal_length)
-                        if distance_active and runtime_focal_length is not None
+                        if is_risk_relevant and distance_active and runtime_focal_length is not None
                         else None
                     )
                     smoothed_distance = distance_history.update(track_id, raw_distance)
@@ -825,10 +1023,11 @@ def run_detection(
                         detection_confidence=confidence,
                         vehicle_speed_kmh=speed_provider.get_vehicle_speed_kmh(),
                     )
-                    smoothed_level = risk_smoother.update(track_id, raw_risk.level, now)
+                    smoothed_level = risk_smoother.update(track_id, raw_risk.level, now) if is_risk_relevant else "UNKNOWN"
                     risk_result = RiskResult(smoothed_level, raw_risk.score, raw_risk.reason, raw_level=raw_risk.level)
-                    frame_risks.append(risk_result)
-                    warning_candidates.append(
+                    if is_risk_relevant:
+                        frame_risks.append(risk_result)
+                        warning_candidates.append(
                         WarningCandidate(
                             track_id=track_id,
                             class_name=class_name,
@@ -838,7 +1037,7 @@ def run_detection(
                             ttc_seconds=fused_ttc,
                             reason=raw_risk.reason,
                         )
-                    )
+                        )
 
                     label_lines = [
                         f"{class_name.upper()} ID:{track_id} {confidence * 100:.0f}% {path_zone}",
@@ -988,10 +1187,20 @@ def run_detection(
         capture.release()
         if sensor_source is not None:
             sensor_source.stop()
-        cv2.destroyAllWindows()
+        safe_destroy_windows()
         print("Camera stopped successfully.")
 
     return 0
+
+
+
+
+
+
+
+
+
+
 
 
 
